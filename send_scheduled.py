@@ -26,22 +26,25 @@ MADRID = ZoneInfo("Europe/Madrid")
 # Horas LOCALES (Europe/Madrid) a las que quieres recibir el mensaje.
 # El DST se maneja solo: no tienes que tocar nada al cambiar la hora.
 HORARIOS_LOCALES = [
+    datetime.time(8, 0),
+    datetime.time(8, 15),
     datetime.time(8, 30),
     datetime.time(18, 0),
-    datetime.time(19, 15),
+    datetime.time(18, 30),
+    datetime.time(19, 0),
+    datetime.time(19, 30),
 ]
 
 # Margen (minutos) alrededor de la hora objetivo, para absorber los retrasos
 # del cron de GitHub Actions.
 #
-# IMPORTANTE: mantenlo por debajo de 15. Tus dos horas de tarde (18:00 y 19:15)
-# están a 75 min una de otra y el salto de DST es de 60 min, así que el cron
-# "de la otra estación" de las 18:00 cae a sólo 15 min de las 19:15 (y
-# viceversa). Con un margen < 15 esos disparos espurios se ignoran y cada
-# aviso se envía una sola vez al día. La contrapartida: si Actions se retrasa
-# más que este margen, ese aviso se salta ese día (para tiempos de metro en
-# tiempo real, un retraso grande ya dejaría los datos obsoletos de todas formas).
-TOLERANCIA_MIN = 12
+# IMPORTANTE: mantenlo por debajo de 30. Con estas horas, el disparo "de la otra
+# estación" más cercano cae a 30 min de un objetivo, así que con un margen < 30
+# se descarta solo y cada aviso se envía una vez al día. Contrapartidas:
+#   - Si Actions se retrasa MÁS que este margen, ese aviso se salta ese día.
+#   - Baja hacia 10 si quieres evitar del todo duplicados por retrasos grandes;
+#     sube hacia 25 si prefieres no perder ninguno (pero siempre < 30).
+TOLERANCIA_MIN = 20
 
 # Paradas que se incluyen en cada aviso automático.
 PARADAS_PROGRAMADAS = ["Hípica", "Universidad"]
@@ -65,7 +68,7 @@ def construir_mensaje():
             t = fetch_parada(nombre)
             lineas.append(formato_parada(nombre, t))
         except Exception as e:
-            lineas.append(f"⚠️ {nombre}: {e}")
+            lineas.append(f"\u26a0\ufe0f {nombre}: {e}")
     return "\n\n".join(lineas)
 
 
