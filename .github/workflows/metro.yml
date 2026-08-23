@@ -1,0 +1,44 @@
+name: Aviso metro programado
+
+# El cron de GitHub Actions es SIEMPRE en UTC y no conoce el DST. Por eso cada
+# hora local se dispara dos veces: una para el offset de verano (UTC+2) y otra
+# para el de invierno (UTC+1). send_scheduled.py comprueba la hora real de
+# Madrid y descarta el disparo que no toca.
+#
+#   08:30 Madrid -> 06:30 UTC (verano) / 07:30 UTC (invierno)
+#   18:00 Madrid -> 16:00 UTC (verano) / 17:00 UTC (invierno)
+#   19:15 Madrid -> 17:15 UTC (verano) / 18:15 UTC (invierno)
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+    - cron: "30 7 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
+    - cron: "15 17 * * *"
+    - cron: "15 18 * * *"
+  workflow_dispatch:        # botón "Run workflow" para probar a mano
+
+permissions:
+  contents: read
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install requests beautifulsoup4 tzdata
+
+      - name: Enviar tiempos
+        run: python send_scheduled.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          # Al lanzarlo a mano, fuerza el envío saltándose la comprobación horaria.
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
