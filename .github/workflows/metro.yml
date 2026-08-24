@@ -1,36 +1,56 @@
 name: Aviso metro programado
 
-# El cron de GitHub Actions es SIEMPRE en UTC y no conoce el DST. Por eso cada
-# hora local se dispara dos veces: una para el offset de verano (UTC+2) y otra
-# para el de invierno (UTC+1). send_scheduled.py comprueba la hora real de
-# Madrid y descarta el disparo que no toca.
+# DISEÑO TOLERANTE A RETRASOS
+# El cron de GitHub Actions es best-effort: puede retrasarse decenas de minutos
+# (o mas) en horas punta. Por eso NO disparamos en el minuto exacto. En su lugar
+# corremos cada 15 min durante las franjas de manana y tarde, en minutos "raros"
+# (:07 :22 :37 :52) para esquivar la congestion de las marcas redondas, y
+# send_scheduled.py decide que enviar segun la hora real de Madrid, saldando
+# cualquier aviso pendiente en cuanto un run consigue arrancar.
 #
-#   08:30 Madrid -> 06:30 UTC (verano) / 07:30 UTC (invierno)
-#   18:00 Madrid -> 16:00 UTC (verano) / 17:00 UTC (invierno)
-#   19:15 Madrid -> 17:15 UTC (verano) / 18:15 UTC (invierno)
+# Las franjas UTC son anchas a proposito: cubren verano (UTC+2) e invierno
+# (UTC+1) y dejan margen de sobra para retrasos. El codigo (hora de Madrid)
+# decide; el cron solo garantiza intentos frecuentes.
+#
+#   Objetivos (hora Madrid): 08:00 08:15 08:30  /  18:00 18:30 19:00 19:30
 
 on:
   schedule:
-    - cron: "30 6 * * *"
-    - cron: "30 7 * * *"
-    - cron: "0 16 * * *"
-    - cron: "0 17 * * *"
-    - cron: "15 17 * * *"
-    - cron: "15 18 * * *"
-  workflow_dispatch:        # botón "Run workflow" para probar a mano
+    - cron: "7,22,37,52 5-10 * * *"     # franja de mananas (UTC)
+    - cron: "7,22,37,52 15-21 * * *"    # franja de tardes (UTC)
+  workflow_dispatch:                    # boton "Run workflow" para probar
 
 permissions:
   contents: read
+
+# Evita que dos ejecuciones solapen y compitan por la cache de estado.
+concurrency:
+  group: metro-scheduled
+  cancel-in-progress: false
 
 jobs:
   enviar:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Fecha de hoy (Madrid)
+        id: fecha
+        run: echo "hoy=$(TZ=Europe/Madrid date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Restaura el estado del dia (que avisos ya se enviaron). El prefijo de
+      # restore-keys recupera la version mas reciente guardada hoy.
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: metro-estado-${{ steps.fecha.outputs.hoy }}-${{ github.run_id }}
+          restore-keys: |
+            metro-estado-${{ steps.fecha.outputs.hoy }}-
 
       - name: Instalar dependencias
         run: pip install requests beautifulsoup4 tzdata
@@ -40,5 +60,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # Al lanzarlo a mano, fuerza el envío saltándose la comprobación horaria.
           FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+
+      # Guarda el estado actualizado con una clave unica (siempre escribe).
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: metro-estado-${{ steps.fecha.outputs.hoy }}-${{ github.run_id }}

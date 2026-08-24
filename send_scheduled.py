@@ -2,15 +2,20 @@
 """
 Envío programado de tiempos de metro por Telegram, disparado por GitHub Actions.
 
-Por qué existe este archivo (y no un JobQueue en un servidor):
-    El cron de GitHub Actions sólo entiende UTC y NO sabe de cambios de hora
-    (DST). Por eso el workflow dispara en TODOS los offsets UTC posibles
-    (verano UTC+2 e invierno UTC+1) para cada hora local deseada, y este script
-    decide si de verdad toca enviar comprobando la hora local de Madrid.
-    Las ejecuciones "de más" simplemente no hacen nada y salen.
+Diseño TOLERANTE A RETRASOS. El cron de GitHub Actions es best-effort y puede
+retrasarse muchísimo (se han visto +100 min en horas punta). Por eso NO se
+dispara en el minuto exacto: el workflow corre cada 15 min durante las franjas
+de mañana y tarde, y este script decide qué enviar según la hora real de Madrid.
+
+Regla: en cada ejecución se envían los objetivos de HOY cuya hora ya ha pasado
+y que aún no se han mandado. Si por un retraso hay varios pendientes a la vez,
+se agrupan en un único mensaje (no te llegan copias seguidas). El estado de
+"qué se ha enviado hoy" persiste entre ejecuciones vía la caché de Actions.
 """
 import datetime
+import json
 import os
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import urllib3
@@ -24,7 +29,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 MADRID = ZoneInfo("Europe/Madrid")
 
 # Horas LOCALES (Europe/Madrid) a las que quieres recibir el mensaje.
-# El DST se maneja solo: no tienes que tocar nada al cambiar la hora.
+# El DST se maneja solo: la franja del cron es ancha y aquí se compara con la
+# hora real de Madrid, así que no tienes que tocar nada al cambiar la hora.
 HORARIOS_LOCALES = [
     datetime.time(8, 0),
     datetime.time(8, 15),
@@ -35,30 +41,43 @@ HORARIOS_LOCALES = [
     datetime.time(19, 30),
 ]
 
-# Margen (minutos) alrededor de la hora objetivo, para absorber los retrasos
-# del cron de GitHub Actions.
-#
-# IMPORTANTE: mantenlo por debajo de 30. Con estas horas, el disparo "de la otra
-# estación" más cercano cae a 30 min de un objetivo, así que con un margen < 30
-# se descarta solo y cada aviso se envía una vez al día. Contrapartidas:
-#   - Si Actions se retrasa MÁS que este margen, ese aviso se salta ese día.
-#   - Baja hacia 10 si quieres evitar del todo duplicados por retrasos grandes;
-#     sube hacia 25 si prefieres no perder ninguno (pero siempre < 30).
-TOLERANCIA_MIN = 20
-
 # Paradas que se incluyen en cada aviso automático.
-PARADAS_PROGRAMADAS = ["Hípica", "Universidad"]
+PARADAS_PROGRAMADAS = ["H\u00edpica", "Universidad"]
+
+# Archivo de estado (qu\u00e9 avisos ya se enviaron HOY). Persiste entre
+# ejecuciones gracias a la cach\u00e9 de GitHub Actions.
+STATE_PATH = Path(os.environ.get("STATE_PATH", "state/sent.json"))
 
 
-def toca_enviar(ahora=None):
-    """¿La hora local actual está dentro del margen de alguna hora objetivo?"""
-    ahora = ahora or datetime.datetime.now(MADRID)
+def cargar_estado(hoy):
+    """Set de horas ya enviadas hoy. Si el estado es de otro d\u00eda, no existe
+    o est\u00e1 corrupto, empieza de cero."""
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if data.get("fecha") == hoy:
+            return set(data.get("enviados", []))
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    return set()
+
+
+def guardar_estado(hoy, enviados):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(
+        json.dumps({"fecha": hoy, "enviados": sorted(enviados)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def horas_pendientes(ahora, enviados):
+    """Objetivos de hoy cuya hora ya pas\u00f3 y que a\u00fan no se han enviado."""
     minutos_ahora = ahora.hour * 60 + ahora.minute
+    pendientes = []
     for t in HORARIOS_LOCALES:
-        objetivo = t.hour * 60 + t.minute
-        if abs(minutos_ahora - objetivo) <= TOLERANCIA_MIN:
-            return True
-    return False
+        clave = t.strftime("%H:%M")
+        if minutos_ahora >= t.hour * 60 + t.minute and clave not in enviados:
+            pendientes.append(clave)
+    return pendientes
 
 
 def construir_mensaje():
@@ -82,19 +101,34 @@ def enviar_telegram(token, chat_id, texto):
 
 
 def main():
-    # FORCE_SEND lo pone el workflow cuando lo lanzas a mano (workflow_dispatch),
-    # para poder probar el envío a cualquier hora saltándote la comprobación.
+    # FORCE_SEND lo pone el workflow al lanzarlo a mano (workflow_dispatch):
+    # env\u00eda una vez para probar y NO toca el estado del d\u00eda.
     forzar = bool(os.environ.get("FORCE_SEND"))
-    if not forzar and not toca_enviar():
-        ahora = datetime.datetime.now(MADRID).strftime("%H:%M")
-        print(f"No toca enviar a las {ahora} (Madrid). Saliendo sin enviar.")
+    ahora = datetime.datetime.now(MADRID)
+    hoy = ahora.strftime("%Y-%m-%d")
+
+    enviados = cargar_estado(hoy)
+    pendientes = horas_pendientes(ahora, enviados)
+
+    if not forzar and not pendientes:
+        ya = sorted(enviados) or "ninguno"
+        print(f"Nada pendiente a las {ahora:%H:%M} (Madrid). Ya enviados hoy: {ya}.")
         return
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["CHAT_ID"]
 
+    # Un solo mensaje por ejecuci\u00f3n: si hay varios objetivos atrasados,
+    # se saldan todos con un \u00fanico aviso.
     enviar_telegram(token, chat_id, construir_mensaje())
-    print("Mensaje enviado.")
+
+    if forzar:
+        print("Env\u00edo forzado (prueba manual). No se modifica el estado.")
+        return
+
+    enviados.update(pendientes)
+    guardar_estado(hoy, enviados)
+    print(f"Enviado. Objetivos cubiertos: {pendientes}. Total hoy: {sorted(enviados)}.")
 
 
 if __name__ == "__main__":
